@@ -33,9 +33,9 @@ mongo_client = None
 # CRITICAL: Devices are now stored in MongoDB, NOT in-memory
 # These dicts are ONLY for live WebSocket connections
 host_ws  = {}   # device_id -> WebSocket  (live host connection)
-viewer_ws = {}  # device_id -> WebSocket  (live viewer connection)
+viewer_ws = {}  # device_id -> list[WebSocket]  (multiple viewers per device)
 viewer_disconnect_tasks = {}  # device_id -> asyncio.Task (delayed disconnect)
-viewer_last_seen = {}  # device_id -> datetime (viewer heartbeat tracking)
+viewer_last_seen = {}  # device_id -> dict[WebSocket, datetime]
 
 
 def gen_token():
@@ -44,15 +44,14 @@ def gen_token():
 
 async def delayed_disconnect(device_id: str):
     """
-    Grace period before notifying host that viewer disconnected.
-    If viewer reconnects within 5 seconds, this task is cancelled.
+    Grace period before notifying host that all viewers disconnected.
     """
     logger.info(f"[DELAYED_DISCONNECT] Starting 5s grace period for device {device_id}")
     await asyncio.sleep(5)
     
-    # After grace period, check if viewer is really gone
-    if device_id not in viewer_ws:
-        logger.info(f"[DELAYED_DISCONNECT] Grace period expired, viewer still gone for device {device_id}")
+    viewers = viewer_ws.get(device_id, [])
+    if not viewers:
+        logger.info(f"[DELAYED_DISCONNECT] Grace period expired, no viewers for device {device_id}")
         hws = host_ws.get(device_id)
         if hws:
             try:
@@ -61,9 +60,8 @@ async def delayed_disconnect(device_id: str):
             except Exception as e:
                 logger.error(f"[DELAYED_DISCONNECT] Failed to notify host {device_id}: {e}")
     else:
-        logger.info(f"[DELAYED_DISCONNECT] Viewer reconnected for device {device_id}, cancelling disconnect")
+        logger.info(f"[DELAYED_DISCONNECT] Viewer(s) still connected for device {device_id}, cancelling disconnect")
     
-    # Clean up task reference
     if device_id in viewer_disconnect_tasks:
         del viewer_disconnect_tasks[device_id]
 
@@ -140,33 +138,37 @@ async def heartbeat_loop():
 async def viewer_heartbeat_loop():
     """
     Monitor viewer connections for timeouts.
-    If viewer hasn't sent ping in 30s, close the connection.
     """
     while True:
         await asyncio.sleep(15)
         now = datetime.now(timezone.utc)
-        stale = []
         
-        for did, last_seen in list(viewer_last_seen.items()):
-            if did in viewer_ws:
-                age = (now - last_seen).total_seconds()
-                if age > 30:
-                    logger.warning(
-                        f"[HEARTBEAT] Viewer for device {did} heartbeat timeout ({age:.0f}s) — closing zombie WS"
-                    )
-                    stale.append(did)
-        
-        for did in stale:
-            ws = viewer_ws.pop(did, None)
-            if ws:
+        for did in list(viewer_ws.keys()):
+            viewers = viewer_ws.get(did, [])
+            stale = []
+            last_seen_map = viewer_last_seen.get(did, {})
+            for ws in list(viewers):
+                last = last_seen_map.get(id(ws))
+                if last:
+                    age = (now - last).total_seconds()
+                    if age > 30:
+                        logger.warning(f"[HEARTBEAT] Viewer for device {did} timeout ({age:.0f}s)")
+                        stale.append(ws)
+            for ws in stale:
                 try:
                     await ws.close()
                 except Exception:
                     pass
-            # Trigger delayed disconnect
-            if did not in viewer_disconnect_tasks:
-                viewer_disconnect_tasks[did] = asyncio.create_task(delayed_disconnect(did))
-                logger.info(f"[HEARTBEAT] Scheduled delayed disconnect for viewer {did}")
+                if did in viewer_ws and ws in viewer_ws[did]:
+                    viewer_ws[did].remove(ws)
+                if did in viewer_last_seen:
+                    viewer_last_seen[did].pop(id(ws), None)
+            
+            # If no viewers left, schedule disconnect notification
+            if did in viewer_ws and not viewer_ws[did]:
+                del viewer_ws[did]
+                if did not in viewer_disconnect_tasks:
+                    viewer_disconnect_tasks[did] = asyncio.create_task(delayed_disconnect(did))
 
 
 async def init_mongodb():
@@ -292,6 +294,27 @@ async def safe_mongo_operation(operation):
 
 
 # ── REST Endpoints ───────────────────────────────────────────
+@api_router.patch("/devices/{device_id}/rename")
+async def rename_device(device_id: str, body: dict):
+    """Rename a device's display name. Device ID stays the same."""
+    new_name = (body.get("device_name") or "").strip()
+    if not new_name or len(new_name) > 100:
+        raise HTTPException(status_code=400, detail="Invalid device name (1-100 chars)")
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    result = await db.devices.update_one(
+        {"device_id": device_id},
+        {"$set": {"device_name": new_name}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    logger.info(f"[RENAME] Device {device_id} renamed to '{new_name}'")
+    return {"success": True, "device_id": device_id, "device_name": new_name}
+
+
 @api_router.get("/")
 async def root():
     return {"message": "WebRTC Remote Desktop - Device Signaling Server"}
@@ -315,6 +338,7 @@ async def health():
             "status": "healthy",
             "devices_total": total,
             "devices_online": online,
+            "viewers_connected": sum(len(v) for v in viewer_ws.values()),
         }
     except Exception as e:
         logger.error(f"[HEALTH] Failed to query MongoDB: {e}")
@@ -712,8 +736,8 @@ async def ws_host(websocket: WebSocket, device_id: str):
                     await websocket.send_json({"type": "pong"})
                 
                 elif t in ("offer", "answer", "ice-candidate"):
-                    vws = viewer_ws.get(device_id)
-                    if vws:
+                    viewers = viewer_ws.get(device_id, [])
+                    for vws in list(viewers):
                         try:
                             await vws.send_text(raw)
                         except Exception:
@@ -730,12 +754,10 @@ async def ws_host(websocket: WebSocket, device_id: str):
                 await update_device_status(device_id, "offline", update_last_seen=True)
                 logger.info(f"[SESSION] Device {device_id} OFFLINE via WS disconnect (active hosts: {len(host_ws)}, active viewers: {len(viewer_ws)})")
             
-            # Notify any active viewer
-            vws = viewer_ws.get(device_id)
-            if vws:
+            # Notify all active viewers
+            for vws in list(viewer_ws.get(device_id, [])):
                 try:
                     await vws.send_json({"type": "host_disconnected"})
-                    logger.info(f"[SESSION] Sent host_disconnected to viewer for device {device_id}")
                 except Exception:
                     pass
     
@@ -777,18 +799,15 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             viewer_disconnect_tasks[device_id].cancel()
             del viewer_disconnect_tasks[device_id]
         
-        # Evict previous viewer (prevent multiple connections)
-        old = viewer_ws.get(device_id)
-        if old:
-            logger.info(f"[SESSION] Replacing existing viewer connection for device {device_id}")
-            try:
-                await old.send_json({"type": "replaced"})
-                await old.close()
-            except Exception:
-                pass
+        # Add this viewer to the list (allow multiple viewers)
+        if device_id not in viewer_ws:
+            viewer_ws[device_id] = []
+        if device_id not in viewer_last_seen:
+            viewer_last_seen[device_id] = {}
         
-        viewer_ws[device_id] = websocket
-        viewer_last_seen[device_id] = datetime.now(timezone.utc)
+        viewer_ws[device_id].append(websocket)
+        viewer_last_seen[device_id][id(websocket)] = datetime.now(timezone.utc)
+        viewer_count = len(viewer_ws[device_id])
         
         await websocket.send_json({
             "type": "connected",
@@ -796,28 +815,25 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             "device_name": device["device_name"],
         })
         
-        # Tell host a viewer is ready — host will create the WebRTC offer
-        # RACE CONDITION FIX: verify host still exists before sending
+        # Tell host a viewer is ready
         hws = host_ws.get(device_id)
         if not hws:
             logger.warning(f"[SESSION] Host {device_id} disappeared before viewer_connected could be sent")
             await websocket.send_json({"type": "error", "message": "Host disconnected"})
             await websocket.close()
-            if viewer_ws.get(device_id) is websocket:
-                del viewer_ws[device_id]
+            if device_id in viewer_ws and websocket in viewer_ws[device_id]:
+                viewer_ws[device_id].remove(websocket)
             return
         
-        # CRITICAL: Only send viewer_connected if this is a NEW viewer connection
-        # Don't spam viewer_connected on every reconnect
         try:
             await hws.send_json({"type": "viewer_connected"})
-            logger.info(f"[SESSION] Viewer connected to device {device_id} — sent viewer_connected to host")
+            logger.info(f"[SESSION] Viewer #{viewer_count} connected to device {device_id}")
         except Exception as e:
             logger.error(f"[SESSION] Failed to reach host {device_id}: {e}")
             await websocket.send_json({"type": "error", "message": "Failed to reach host"})
             await websocket.close()
-            if viewer_ws.get(device_id) is websocket:
-                del viewer_ws[device_id]
+            if device_id in viewer_ws and websocket in viewer_ws[device_id]:
+                viewer_ws[device_id].remove(websocket)
             return
         
         try:
@@ -827,8 +843,7 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
                 t = data.get("type")
                 
                 if t == "ping":
-                    # Track viewer heartbeat
-                    viewer_last_seen[device_id] = datetime.now(timezone.utc)
+                    viewer_last_seen[device_id][id(websocket)] = datetime.now(timezone.utc)
                     await websocket.send_json({"type": "pong"})
                 
                 elif t in ("offer", "answer", "ice-candidate"):
@@ -840,23 +855,25 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
                             pass
         
         except WebSocketDisconnect:
-            logger.info(f"[SESSION] Viewer disconnected from device {device_id} (WebSocketDisconnect)")
+            logger.info(f"[SESSION] Viewer disconnected from device {device_id}")
         except Exception as e:
             logger.error(f"[SESSION] Viewer WS error ({device_id}): {e}")
         finally:
-            # Remove viewer reference
-            if viewer_ws.get(device_id) is websocket:
-                del viewer_ws[device_id]
-                logger.info(f"[SESSION] Removed viewer_ws reference for device {device_id}")
-            
-            # DO NOT immediately notify host — use delayed disconnect with grace period
-            if device_id in viewer_disconnect_tasks:
-                # Already have a pending disconnect task, cancel it first
-                viewer_disconnect_tasks[device_id].cancel()
-            
-            # Schedule delayed disconnect (5 second grace period)
-            viewer_disconnect_tasks[device_id] = asyncio.create_task(delayed_disconnect(device_id))
-            logger.info(f"[SESSION] Scheduled delayed disconnect for device {device_id}")
+            # Remove this specific viewer
+            if device_id in viewer_ws and websocket in viewer_ws[device_id]:
+                viewer_ws[device_id].remove(websocket)
+                if device_id in viewer_last_seen:
+                    viewer_last_seen[device_id].pop(id(websocket), None)
+                remaining = len(viewer_ws[device_id])
+                logger.info(f"[SESSION] Viewer removed from device {device_id}, {remaining} viewer(s) remaining")
+                
+                # Clean up empty list
+                if not viewer_ws[device_id]:
+                    del viewer_ws[device_id]
+                    # Schedule delayed disconnect notification to host
+                    if device_id not in viewer_disconnect_tasks:
+                        viewer_disconnect_tasks[device_id] = asyncio.create_task(delayed_disconnect(device_id))
+                        logger.info(f"[SESSION] Scheduled delayed disconnect for device {device_id}")
     
     except Exception as e:
         logger.error(f"[WS_VIEWER] Unexpected error for device {device_id}: {e}")
