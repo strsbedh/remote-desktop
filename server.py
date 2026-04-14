@@ -294,6 +294,39 @@ async def safe_mongo_operation(operation):
 
 
 # ── REST Endpoints ───────────────────────────────────────────
+@api_router.post("/device-credential/{device_id}")
+async def save_device_credential(device_id: str, body: dict):
+    """Save verified credential for a device."""
+    credential = (body.get("credential") or "").strip()
+    username = (body.get("username") or "").strip()
+    if not credential:
+        raise HTTPException(status_code=400, detail="No credential provided")
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    now = datetime.now(timezone.utc)
+    await db.device_credentials.update_one(
+        {"device_id": device_id},
+        {"$set": {"device_id": device_id, "credential": credential, "username": username, "updated_at": now}},
+        upsert=True
+    )
+    logger.info(f"[CREDENTIAL] Saved credential for device {device_id}")
+    return {"success": True}
+
+
+@api_router.get("/device-credential/{device_id}")
+async def get_device_credential(device_id: str):
+    """Retrieve saved credential for a device."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    doc = await db.device_credentials.find_one({"device_id": device_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="No credential saved")
+    updated_at = doc["updated_at"]
+    if hasattr(updated_at, 'isoformat'):
+        updated_at = updated_at.isoformat()
+    return {"device_id": device_id, "credential": doc["credential"], "username": doc.get("username", ""), "updated_at": updated_at}
+
+
 @api_router.patch("/devices/{device_id}/rename")
 async def rename_device(device_id: str, body: dict):
     """Rename a device's display name. Device ID stays the same."""
