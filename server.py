@@ -372,6 +372,7 @@ async def health():
             "devices_total": total,
             "devices_online": online,
             "viewers_connected": sum(len(v) for v in viewer_ws.values()),
+            "viewer_connections": {device_id: len(viewers) for device_id, viewers in viewer_ws.items()},
         }
     except Exception as e:
         logger.error(f"[HEALTH] Failed to query MongoDB: {e}")
@@ -513,6 +514,49 @@ async def list_devices():
             status_code=500,
             detail="Failed to retrieve devices"
         )
+
+
+@api_router.delete("/devices/{device_id}")
+async def delete_device(device_id: str):
+    """Delete a device and all its associated data."""
+    if not mongo_client:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    try:
+        # Delete from MongoDB
+        result = await db.devices.delete_one({"device_id": device_id})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Device not found")
+        
+        # Delete associated data
+        await db.device_notes.delete_many({"device_id": device_id})
+        await db.device_screenshots.delete_one({"device_id": device_id})
+        await db.device_credentials.delete_one({"device_id": device_id})
+        
+        # Remove from live connections if present
+        if device_id in host_ws:
+            try:
+                await host_ws[device_id].close()
+            except:
+                pass
+            del host_ws[device_id]
+        
+        if device_id in viewer_ws:
+            for ws in viewer_ws[device_id]:
+                try:
+                    await ws.close()
+                except:
+                    pass
+            del viewer_ws[device_id]
+        
+        logger.info(f"Device {device_id} deleted successfully")
+        return {"success": True, "message": "Device deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[DELETE_DEVICE] Failed to delete device {device_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete device")
 
 
 @api_router.get("/devices/{device_id}")
