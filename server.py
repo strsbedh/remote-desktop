@@ -33,9 +33,10 @@ mongo_client = None
 # CRITICAL: Devices are now stored in MongoDB, NOT in-memory
 # These dicts are ONLY for live WebSocket connections
 host_ws  = {}   # device_id -> WebSocket  (live host connection)
-viewer_ws = {}  # device_id -> list[WebSocket]  (multiple viewers per device)
+viewer_ws = {}  # device_id -> dict[viewer_id, WebSocket]  (multiple viewers per device with IDs)
 viewer_disconnect_tasks = {}  # device_id -> asyncio.Task (delayed disconnect)
-viewer_last_seen = {}  # device_id -> dict[WebSocket, datetime]
+viewer_last_seen = {}  # device_id -> dict[viewer_id, datetime]
+viewer_counter = {}  # device_id -> int (counter for generating viewer IDs)
 
 
 def gen_token():
@@ -49,7 +50,7 @@ async def delayed_disconnect(device_id: str):
     logger.info(f"[DELAYED_DISCONNECT] Starting 5s grace period for device {device_id}")
     await asyncio.sleep(5)
     
-    viewers = viewer_ws.get(device_id, [])
+    viewers = viewer_ws.get(device_id, {})
     if not viewers:
         logger.info(f"[DELAYED_DISCONNECT] Grace period expired, no viewers for device {device_id}")
         hws = host_ws.get(device_id)
@@ -144,25 +145,25 @@ async def viewer_heartbeat_loop():
         now = datetime.now(timezone.utc)
         
         for did in list(viewer_ws.keys()):
-            viewers = viewer_ws.get(did, [])
+            viewers = viewer_ws.get(did, {})
             stale = []
             last_seen_map = viewer_last_seen.get(did, {})
-            for ws in list(viewers):
-                last = last_seen_map.get(id(ws))
+            for viewer_id, ws in list(viewers.items()):
+                last = last_seen_map.get(viewer_id)
                 if last:
                     age = (now - last).total_seconds()
                     if age > 30:
-                        logger.warning(f"[HEARTBEAT] Viewer for device {did} timeout ({age:.0f}s)")
-                        stale.append(ws)
-            for ws in stale:
+                        logger.warning(f"[HEARTBEAT] Viewer {viewer_id} for device {did} timeout ({age:.0f}s)")
+                        stale.append((viewer_id, ws))
+            for viewer_id, ws in stale:
                 try:
                     await ws.close()
                 except Exception:
                     pass
-                if did in viewer_ws and ws in viewer_ws[did]:
-                    viewer_ws[did].remove(ws)
-                if did in viewer_last_seen:
-                    viewer_last_seen[did].pop(id(ws), None)
+                if did in viewer_ws and viewer_id in viewer_ws[did]:
+                    del viewer_ws[did][viewer_id]
+                if did in viewer_last_seen and viewer_id in viewer_last_seen[did]:
+                    del viewer_last_seen[did][viewer_id]
             
             # If no viewers left, schedule disconnect notification
             if did in viewer_ws and not viewer_ws[did]:
@@ -542,7 +543,7 @@ async def delete_device(device_id: str):
             del host_ws[device_id]
         
         if device_id in viewer_ws:
-            for ws in viewer_ws[device_id]:
+            for ws in viewer_ws[device_id].values():
                 try:
                     await ws.close()
                 except:
@@ -813,12 +814,25 @@ async def ws_host(websocket: WebSocket, device_id: str):
                     await websocket.send_json({"type": "pong"})
                 
                 elif t in ("offer", "answer", "ice-candidate"):
-                    viewers = viewer_ws.get(device_id, [])
-                    for vws in list(viewers):
+                    # Route WebRTC messages to specific viewer if viewer_id is provided
+                    viewer_id = data.get("viewer_id")
+                    viewers = viewer_ws.get(device_id, {})
+                    
+                    if viewer_id and viewer_id in viewers:
+                        # Route to specific viewer
                         try:
-                            await vws.send_text(raw)
-                        except Exception:
-                            pass
+                            await viewers[viewer_id].send_text(raw)
+                            logger.info(f"[SESSION] Routed {t} to viewer {viewer_id} for device {device_id}")
+                        except Exception as e:
+                            logger.error(f"[SESSION] Failed to route {t} to viewer {viewer_id}: {e}")
+                    else:
+                        # Fallback: broadcast to all viewers (backward compatibility)
+                        logger.warning(f"[SESSION] No viewer_id in {t} message, broadcasting to all viewers")
+                        for vws in list(viewers.values()):
+                            try:
+                                await vws.send_text(raw)
+                            except Exception:
+                                pass
         
         except WebSocketDisconnect:
             logger.info(f"[SESSION] Device {device_id} WS disconnected (WebSocketDisconnect)")
@@ -832,7 +846,8 @@ async def ws_host(websocket: WebSocket, device_id: str):
                 logger.info(f"[SESSION] Device {device_id} OFFLINE via WS disconnect (active hosts: {len(host_ws)}, active viewers: {len(viewer_ws)})")
             
             # Notify all active viewers
-            for vws in list(viewer_ws.get(device_id, [])):
+            viewers = viewer_ws.get(device_id, {})
+            for vws in list(viewers.values()):
                 try:
                     await vws.send_json({"type": "host_disconnected"})
                 except Exception:
@@ -876,20 +891,27 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             viewer_disconnect_tasks[device_id].cancel()
             del viewer_disconnect_tasks[device_id]
         
-        # Add this viewer to the list (allow multiple viewers)
+        # Generate unique viewer ID for this connection
+        if device_id not in viewer_counter:
+            viewer_counter[device_id] = 0
+        viewer_counter[device_id] += 1
+        viewer_id = f"viewer_{viewer_counter[device_id]}"
+        
+        # Add this viewer to the dict with unique ID
         if device_id not in viewer_ws:
-            viewer_ws[device_id] = []
+            viewer_ws[device_id] = {}
         if device_id not in viewer_last_seen:
             viewer_last_seen[device_id] = {}
         
-        viewer_ws[device_id].append(websocket)
-        viewer_last_seen[device_id][id(websocket)] = datetime.now(timezone.utc)
+        viewer_ws[device_id][viewer_id] = websocket
+        viewer_last_seen[device_id][viewer_id] = datetime.now(timezone.utc)
         viewer_count = len(viewer_ws[device_id])
         
         await websocket.send_json({
             "type": "connected",
             "device_id": device_id,
             "device_name": device["device_name"],
+            "viewer_id": viewer_id,  # Send viewer ID to client
         })
         
         # Tell host a viewer is ready
@@ -903,14 +925,14 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             return
         
         try:
-            await hws.send_json({"type": "viewer_connected"})
-            logger.info(f"[SESSION] Viewer #{viewer_count} connected to device {device_id}")
+            await hws.send_json({"type": "viewer_connected", "viewer_id": viewer_id})
+            logger.info(f"[SESSION] Viewer #{viewer_count} ({viewer_id}) connected to device {device_id}")
         except Exception as e:
             logger.error(f"[SESSION] Failed to reach host {device_id}: {e}")
             await websocket.send_json({"type": "error", "message": "Failed to reach host"})
             await websocket.close()
-            if device_id in viewer_ws and websocket in viewer_ws[device_id]:
-                viewer_ws[device_id].remove(websocket)
+            if device_id in viewer_ws and viewer_id in viewer_ws[device_id]:
+                del viewer_ws[device_id][viewer_id]
             return
         
         try:
@@ -920,14 +942,16 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
                 t = data.get("type")
                 
                 if t == "ping":
-                    viewer_last_seen[device_id][id(websocket)] = datetime.now(timezone.utc)
+                    viewer_last_seen[device_id][viewer_id] = datetime.now(timezone.utc)
                     await websocket.send_json({"type": "pong"})
                 
                 elif t in ("offer", "answer", "ice-candidate"):
+                    # Add viewer_id to message for routing
+                    data["viewer_id"] = viewer_id
                     hws = host_ws.get(device_id)
                     if hws:
                         try:
-                            await hws.send_text(raw)
+                            await hws.send_text(json.dumps(data))
                         except Exception:
                             pass
         
@@ -937,14 +961,14 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             logger.error(f"[SESSION] Viewer WS error ({device_id}): {e}")
         finally:
             # Remove this specific viewer
-            if device_id in viewer_ws and websocket in viewer_ws[device_id]:
-                viewer_ws[device_id].remove(websocket)
-                if device_id in viewer_last_seen:
-                    viewer_last_seen[device_id].pop(id(websocket), None)
+            if device_id in viewer_ws and viewer_id in viewer_ws[device_id]:
+                del viewer_ws[device_id][viewer_id]
+                if device_id in viewer_last_seen and viewer_id in viewer_last_seen[device_id]:
+                    del viewer_last_seen[device_id][viewer_id]
                 remaining = len(viewer_ws[device_id])
-                logger.info(f"[SESSION] Viewer removed from device {device_id}, {remaining} viewer(s) remaining")
+                logger.info(f"[SESSION] Viewer {viewer_id} removed from device {device_id}, {remaining} viewer(s) remaining")
                 
-                # Clean up empty list
+                # Clean up empty dict
                 if not viewer_ws[device_id]:
                     del viewer_ws[device_id]
                     # Schedule delayed disconnect notification to host
