@@ -33,10 +33,9 @@ mongo_client = None
 # CRITICAL: Devices are now stored in MongoDB, NOT in-memory
 # These dicts are ONLY for live WebSocket connections
 host_ws  = {}   # device_id -> WebSocket  (live host connection)
-viewer_ws = {}  # device_id -> dict[viewer_id, WebSocket]  (multiple viewers per device with IDs)
+viewer_ws = {}  # device_id -> list[WebSocket]  (multiple viewers per device)
 viewer_disconnect_tasks = {}  # device_id -> asyncio.Task (delayed disconnect)
-viewer_last_seen = {}  # device_id -> dict[viewer_id, datetime]
-viewer_counter = {}  # device_id -> int (counter for generating viewer IDs)
+viewer_last_seen = {}  # device_id -> dict[WebSocket, datetime]
 
 
 def gen_token():
@@ -50,7 +49,7 @@ async def delayed_disconnect(device_id: str):
     logger.info(f"[DELAYED_DISCONNECT] Starting 5s grace period for device {device_id}")
     await asyncio.sleep(5)
     
-    viewers = viewer_ws.get(device_id, {})
+    viewers = viewer_ws.get(device_id, [])
     if not viewers:
         logger.info(f"[DELAYED_DISCONNECT] Grace period expired, no viewers for device {device_id}")
         hws = host_ws.get(device_id)
@@ -145,25 +144,25 @@ async def viewer_heartbeat_loop():
         now = datetime.now(timezone.utc)
         
         for did in list(viewer_ws.keys()):
-            viewers = viewer_ws.get(did, {})
+            viewers = viewer_ws.get(did, [])
             stale = []
             last_seen_map = viewer_last_seen.get(did, {})
-            for viewer_id, ws in list(viewers.items()):
-                last = last_seen_map.get(viewer_id)
+            for ws in list(viewers):
+                last = last_seen_map.get(id(ws))
                 if last:
                     age = (now - last).total_seconds()
                     if age > 30:
-                        logger.warning(f"[HEARTBEAT] Viewer {viewer_id} for device {did} timeout ({age:.0f}s)")
-                        stale.append((viewer_id, ws))
-            for viewer_id, ws in stale:
+                        logger.warning(f"[HEARTBEAT] Viewer for device {did} timeout ({age:.0f}s)")
+                        stale.append(ws)
+            for ws in stale:
                 try:
                     await ws.close()
                 except Exception:
                     pass
-                if did in viewer_ws and viewer_id in viewer_ws[did]:
-                    del viewer_ws[did][viewer_id]
-                if did in viewer_last_seen and viewer_id in viewer_last_seen[did]:
-                    del viewer_last_seen[did][viewer_id]
+                if did in viewer_ws and ws in viewer_ws[did]:
+                    viewer_ws[did].remove(ws)
+                if did in viewer_last_seen:
+                    viewer_last_seen[did].pop(id(ws), None)
             
             # If no viewers left, schedule disconnect notification
             if did in viewer_ws and not viewer_ws[did]:
@@ -229,6 +228,7 @@ class RegisterBody(BaseModel):
     device_id: str
     device_name: str
     auth_token: Optional[str] = None
+    host_ip: Optional[str] = None
 
 
 class DeviceNoteRequest(BaseModel):
@@ -373,7 +373,6 @@ async def health():
             "devices_total": total,
             "devices_online": online,
             "viewers_connected": sum(len(v) for v in viewer_ws.values()),
-            "viewer_connections": {device_id: len(viewers) for device_id, viewers in viewer_ws.items()},
         }
     except Exception as e:
         logger.error(f"[HEALTH] Failed to query MongoDB: {e}")
@@ -410,14 +409,15 @@ async def register_device(body: RegisterBody):
                 return {"success": False, "error": "Invalid auth token"}
             
             # Update mutable fields; preserve auth_token and status
+            update = {
+                "device_name": body.device_name,
+                "last_seen": datetime.now(timezone.utc).isoformat()
+            }
+            if body.host_ip:
+                update["host_ip"] = body.host_ip
             await db.devices.update_one(
                 {"device_id": did},
-                {
-                    "$set": {
-                        "device_name": body.device_name,
-                        "last_seen": datetime.now(timezone.utc).isoformat()
-                    }
-                }
+                {"$set": update}
             )
             logger.info(f"Device {did} re-registered (name={body.device_name}) token=...{existing['auth_token'][-6:]}")
             return {"success": True, "device_id": did, "auth_token": existing["auth_token"]}
@@ -431,6 +431,8 @@ async def register_device(body: RegisterBody):
             "status": "offline",
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
+        if body.host_ip:
+            device_doc["host_ip"] = body.host_ip
         await db.devices.insert_one(device_doc)
         logger.info(f"Device {did} registered (name={body.device_name}) token=...{token[-6:]}")
         return {"success": True, "device_id": did, "auth_token": token}
@@ -499,13 +501,16 @@ async def list_devices():
             # Derive status from live WS map — single source of truth
             status = device_status(d["device_id"])
             
-            devices_list.append({
+            entry = {
                 "device_id": d["device_id"],
                 "device_name": d["device_name"],
                 "status": status,
                 "last_seen": d["last_seen"],
                 "last_online_ago": calculate_last_online_ago(d["last_seen"], status == "online"),
-            })
+            }
+            if d.get("host_ip"):
+                entry["host_ip"] = d["host_ip"]
+            devices_list.append(entry)
         
         return {"devices": devices_list}
         
@@ -515,49 +520,6 @@ async def list_devices():
             status_code=500,
             detail="Failed to retrieve devices"
         )
-
-
-@api_router.delete("/devices/{device_id}")
-async def delete_device(device_id: str):
-    """Delete a device and all its associated data."""
-    if not mongo_client:
-        raise HTTPException(status_code=503, detail="Database unavailable")
-    
-    try:
-        # Delete from MongoDB
-        result = await db.devices.delete_one({"device_id": device_id})
-        if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail="Device not found")
-        
-        # Delete associated data
-        await db.device_notes.delete_many({"device_id": device_id})
-        await db.device_screenshots.delete_one({"device_id": device_id})
-        await db.device_credentials.delete_one({"device_id": device_id})
-        
-        # Remove from live connections if present
-        if device_id in host_ws:
-            try:
-                await host_ws[device_id].close()
-            except:
-                pass
-            del host_ws[device_id]
-        
-        if device_id in viewer_ws:
-            for ws in viewer_ws[device_id].values():
-                try:
-                    await ws.close()
-                except:
-                    pass
-            del viewer_ws[device_id]
-        
-        logger.info(f"Device {device_id} deleted successfully")
-        return {"success": True, "message": "Device deleted successfully"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[DELETE_DEVICE] Failed to delete device {device_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete device")
 
 
 @api_router.get("/devices/{device_id}")
@@ -577,13 +539,16 @@ async def get_device(device_id: str):
         if not d:
             return {"exists": False}
         
-        return {
+        result = {
             "exists": True,
             "device_id": d["device_id"],
             "device_name": d["device_name"],
             "status": device_status(device_id),  # live, not cached
             "last_seen": d["last_seen"],
         }
+        if d.get("host_ip"):
+            result["host_ip"] = d["host_ip"]
+        return result
     except Exception as e:
         logger.error(f"[GET_DEVICE] Failed to get device {device_id}: {e}")
         raise HTTPException(
@@ -814,25 +779,12 @@ async def ws_host(websocket: WebSocket, device_id: str):
                     await websocket.send_json({"type": "pong"})
                 
                 elif t in ("offer", "answer", "ice-candidate"):
-                    # Route WebRTC messages to specific viewer if viewer_id is provided
-                    viewer_id = data.get("viewer_id")
-                    viewers = viewer_ws.get(device_id, {})
-                    
-                    if viewer_id and viewer_id in viewers:
-                        # Route to specific viewer
+                    viewers = viewer_ws.get(device_id, [])
+                    for vws in list(viewers):
                         try:
-                            await viewers[viewer_id].send_text(raw)
-                            logger.info(f"[SESSION] Routed {t} to viewer {viewer_id} for device {device_id}")
-                        except Exception as e:
-                            logger.error(f"[SESSION] Failed to route {t} to viewer {viewer_id}: {e}")
-                    else:
-                        # Fallback: broadcast to all viewers (backward compatibility)
-                        logger.warning(f"[SESSION] No viewer_id in {t} message, broadcasting to all viewers")
-                        for vws in list(viewers.values()):
-                            try:
-                                await vws.send_text(raw)
-                            except Exception:
-                                pass
+                            await vws.send_text(raw)
+                        except Exception:
+                            pass
         
         except WebSocketDisconnect:
             logger.info(f"[SESSION] Device {device_id} WS disconnected (WebSocketDisconnect)")
@@ -846,8 +798,7 @@ async def ws_host(websocket: WebSocket, device_id: str):
                 logger.info(f"[SESSION] Device {device_id} OFFLINE via WS disconnect (active hosts: {len(host_ws)}, active viewers: {len(viewer_ws)})")
             
             # Notify all active viewers
-            viewers = viewer_ws.get(device_id, {})
-            for vws in list(viewers.values()):
+            for vws in list(viewer_ws.get(device_id, [])):
                 try:
                     await vws.send_json({"type": "host_disconnected"})
                 except Exception:
@@ -891,27 +842,20 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             viewer_disconnect_tasks[device_id].cancel()
             del viewer_disconnect_tasks[device_id]
         
-        # Generate unique viewer ID for this connection
-        if device_id not in viewer_counter:
-            viewer_counter[device_id] = 0
-        viewer_counter[device_id] += 1
-        viewer_id = f"viewer_{viewer_counter[device_id]}"
-        
-        # Add this viewer to the dict with unique ID
+        # Add this viewer to the list (allow multiple viewers)
         if device_id not in viewer_ws:
-            viewer_ws[device_id] = {}
+            viewer_ws[device_id] = []
         if device_id not in viewer_last_seen:
             viewer_last_seen[device_id] = {}
         
-        viewer_ws[device_id][viewer_id] = websocket
-        viewer_last_seen[device_id][viewer_id] = datetime.now(timezone.utc)
+        viewer_ws[device_id].append(websocket)
+        viewer_last_seen[device_id][id(websocket)] = datetime.now(timezone.utc)
         viewer_count = len(viewer_ws[device_id])
         
         await websocket.send_json({
             "type": "connected",
             "device_id": device_id,
             "device_name": device["device_name"],
-            "viewer_id": viewer_id,  # Send viewer ID to client
         })
         
         # Tell host a viewer is ready
@@ -925,14 +869,14 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             return
         
         try:
-            await hws.send_json({"type": "viewer_connected", "viewer_id": viewer_id})
-            logger.info(f"[SESSION] Viewer #{viewer_count} ({viewer_id}) connected to device {device_id}")
+            await hws.send_json({"type": "viewer_connected"})
+            logger.info(f"[SESSION] Viewer #{viewer_count} connected to device {device_id}")
         except Exception as e:
             logger.error(f"[SESSION] Failed to reach host {device_id}: {e}")
             await websocket.send_json({"type": "error", "message": "Failed to reach host"})
             await websocket.close()
-            if device_id in viewer_ws and viewer_id in viewer_ws[device_id]:
-                del viewer_ws[device_id][viewer_id]
+            if device_id in viewer_ws and websocket in viewer_ws[device_id]:
+                viewer_ws[device_id].remove(websocket)
             return
         
         try:
@@ -942,16 +886,14 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
                 t = data.get("type")
                 
                 if t == "ping":
-                    viewer_last_seen[device_id][viewer_id] = datetime.now(timezone.utc)
+                    viewer_last_seen[device_id][id(websocket)] = datetime.now(timezone.utc)
                     await websocket.send_json({"type": "pong"})
                 
                 elif t in ("offer", "answer", "ice-candidate"):
-                    # Add viewer_id to message for routing
-                    data["viewer_id"] = viewer_id
                     hws = host_ws.get(device_id)
                     if hws:
                         try:
-                            await hws.send_text(json.dumps(data))
+                            await hws.send_text(raw)
                         except Exception:
                             pass
         
@@ -961,14 +903,14 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             logger.error(f"[SESSION] Viewer WS error ({device_id}): {e}")
         finally:
             # Remove this specific viewer
-            if device_id in viewer_ws and viewer_id in viewer_ws[device_id]:
-                del viewer_ws[device_id][viewer_id]
-                if device_id in viewer_last_seen and viewer_id in viewer_last_seen[device_id]:
-                    del viewer_last_seen[device_id][viewer_id]
+            if device_id in viewer_ws and websocket in viewer_ws[device_id]:
+                viewer_ws[device_id].remove(websocket)
+                if device_id in viewer_last_seen:
+                    viewer_last_seen[device_id].pop(id(websocket), None)
                 remaining = len(viewer_ws[device_id])
-                logger.info(f"[SESSION] Viewer {viewer_id} removed from device {device_id}, {remaining} viewer(s) remaining")
+                logger.info(f"[SESSION] Viewer removed from device {device_id}, {remaining} viewer(s) remaining")
                 
-                # Clean up empty dict
+                # Clean up empty list
                 if not viewer_ws[device_id]:
                     del viewer_ws[device_id]
                     # Schedule delayed disconnect notification to host
