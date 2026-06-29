@@ -200,6 +200,10 @@ async def init_mongodb():
         await db.device_screenshots.create_index('device_id', unique=True)
         logger.info("[MONGODB] ✅ Created unique index on device_screenshots.device_id")
         
+        # Create indexes for device_cameras collection
+        await db.device_cameras.create_index('device_id', unique=True)
+        logger.info("[MONGODB] ✅ Created unique index on device_cameras.device_id")
+        
         logger.info(f"[MONGODB] ✅ Connected successfully to database: {db_name}")
     except Exception as e:
         logger.error(f"[MONGODB] ❌ Connection failed: {e}")
@@ -762,6 +766,87 @@ async def refresh_device_screenshot(device_id: str):
             status_code=500,
             detail="Failed to refresh screenshot"
         )
+
+
+class DeviceCameraRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100)
+    image: str = Field(..., min_length=1)
+    
+    @field_validator('image')
+    @classmethod
+    def validate_image(cls, v):
+        import base64
+        try:
+            image_data = v.split(',')[1] if ',' in v else v
+            base64.b64decode(image_data)
+        except Exception:
+            raise ValueError('Invalid base64 encoding')
+        if len(v) > 266 * 1024:
+            raise ValueError('Image too large (max 200KB)')
+        return v
+
+
+class DeviceCameraResponse(BaseModel):
+    device_id: str
+    image: str
+    updated_at: str
+
+
+@api_router.post("/device-camera")
+async def upload_device_camera(req: DeviceCameraRequest):
+    async def operation():
+        now = datetime.now(timezone.utc)
+        await db.device_cameras.update_one(
+            {"device_id": req.device_id},
+            {"$set": {"device_id": req.device_id, "image": req.image, "updated_at": now}},
+            upsert=True
+        )
+        return {
+            "success": True,
+            "device_id": req.device_id,
+            "updated_at": now.isoformat(),
+            "size_bytes": len(req.image)
+        }
+    return await safe_mongo_operation(operation)
+
+
+@api_router.get("/device-camera/{device_id}")
+async def get_device_camera(device_id: str):
+    async def operation():
+        doc = await db.device_cameras.find_one({"device_id": device_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Camera image not found")
+        return DeviceCameraResponse(
+            device_id=doc["device_id"],
+            image=doc["image"],
+            updated_at=doc["updated_at"].isoformat()
+        )
+    return await safe_mongo_operation(operation)
+
+
+@api_router.post("/device-camera/capture/{device_id}")
+async def capture_device_camera(device_id: str):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        device = await db.devices.find_one({"device_id": device_id})
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        hws = host_ws.get(device_id)
+        if not hws:
+            raise HTTPException(status_code=503, detail="Device is offline")
+        try:
+            await hws.send_json({"type": "capture_camera_frame"})
+            logger.info(f"[CAMERA] Sent capture command to device {device_id}")
+            return {"success": True, "message": "Camera capture triggered", "device_id": device_id}
+        except Exception as e:
+            logger.error(f"[CAMERA] Failed to send capture command to {device_id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to send capture command to device")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[CAMERA] Error capturing camera for {device_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to capture camera")
 
 
 # ── Host WebSocket ────────────────────────────────────────────
