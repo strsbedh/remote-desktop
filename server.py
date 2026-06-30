@@ -841,7 +841,15 @@ async def capture_device_camera(device_id: str):
             return {"success": True, "message": "Camera capture triggered", "device_id": device_id}
         except Exception as e:
             logger.error(f"[CAMERA] Failed to send capture command to {device_id}: {e}")
-            raise HTTPException(status_code=500, detail="Failed to send capture command to device")
+            # If WebSocket is dead, evict it so subsequent requests fail fast with 503
+            try:
+                if host_ws.get(device_id) is hws:
+                    del host_ws[device_id]
+                    await update_device_status(device_id, "offline")
+                    logger.info(f"[CAMERA] Evicted stale WS for device {device_id}")
+            except Exception:
+                pass
+            raise HTTPException(status_code=503, detail="Device WebSocket disconnected")
     except HTTPException:
         raise
     except Exception as e:
