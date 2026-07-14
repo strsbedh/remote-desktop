@@ -414,9 +414,8 @@ async def register_device(body: RegisterBody):
                 logger.warning(f"Device {did} re-registration rejected — invalid token")
                 return {"success": False, "error": "Invalid auth token"}
             
-            # Update mutable fields; preserve auth_token and status
+            # Update mutable fields; preserve auth_token, status, AND device_name (dashboard rename)
             update = {
-                "device_name": body.device_name,
                 "last_seen": datetime.now(timezone.utc).isoformat()
             }
             if body.host_ip:
@@ -425,7 +424,7 @@ async def register_device(body: RegisterBody):
                 {"device_id": did},
                 {"$set": update}
             )
-            logger.info(f"Device {did} re-registered (name={body.device_name}) token=...{existing['auth_token'][-6:]}")
+            logger.info(f"Device {did} re-registered (preserved name='{existing['device_name']}') token=...{existing['auth_token'][-6:]}")
             return {"success": True, "device_id": did, "auth_token": existing["auth_token"]}
         
         # New device - insert into MongoDB
