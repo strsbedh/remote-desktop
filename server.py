@@ -10,8 +10,9 @@ import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from typing import Optional, List
 from motor.motor_asyncio import AsyncIOMotorClient
+from bson.objectid import ObjectId
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -67,12 +68,17 @@ async def delayed_disconnect(device_id: str):
         del viewer_disconnect_tasks[device_id]
 
 
-def device_status(device_id: str) -> str:
+def device_status(device_id: str, mongodb_status: str = None) -> str:
     """
     Single source of truth for online/offline.
     A device is ONLINE if and only if there is an active WebSocket in host_ws.
+    Falls back to 'booting' from MongoDB if set (boot-time service active).
     """
-    return "online" if device_id in host_ws else "offline"
+    if device_id in host_ws:
+        return "online"
+    if mongodb_status == "booting":
+        return "booting"
+    return "offline"
 
 
 async def update_device_status(device_id: str, status: str, update_last_seen: bool = True):
@@ -192,9 +198,9 @@ async def init_mongodb():
         await db.devices.create_index('device_id', unique=True)
         logger.info("[MONGODB] ✅ Created unique index on devices.device_id")
         
-        # Create indexes for device_notes collection
-        await db.device_notes.create_index('device_id', unique=True)
-        logger.info("[MONGODB] ✅ Created unique index on device_notes.device_id")
+        # Create indexes for device_notes collection (non-unique — supports multiple notes per device)
+        await db.device_notes.create_index('device_id')
+        logger.info("[MONGODB] ✅ Created index on device_notes.device_id")
         
         # Create indexes for device_screenshots collection
         await db.device_screenshots.create_index('device_id', unique=True)
@@ -234,6 +240,7 @@ class RegisterBody(BaseModel):
     device_name: str
     auth_token: Optional[str] = None
     host_ip: Optional[str] = None
+    whoami: Optional[str] = None
 
 
 class DeviceNoteRequest(BaseModel):
@@ -245,6 +252,21 @@ class DeviceNoteResponse(BaseModel):
     device_id: str
     note: str
     updated_at: str
+
+
+class NoteEntry(BaseModel):
+    device_id: str
+    note: str = Field(..., max_length=10000)
+    author: str = Field(default="admin", max_length=100)
+    created_at: Optional[str] = None
+
+
+class NoteEntryResponse(BaseModel):
+    id: str
+    device_id: str
+    note: str
+    author: str
+    created_at: str
 
 
 class DeviceScreenshotRequest(BaseModel):
@@ -420,6 +442,8 @@ async def register_device(body: RegisterBody):
             }
             if body.host_ip:
                 update["host_ip"] = body.host_ip
+            if body.whoami:
+                update["whoami"] = body.whoami
             await db.devices.update_one(
                 {"device_id": did},
                 {"$set": update}
@@ -438,6 +462,8 @@ async def register_device(body: RegisterBody):
         }
         if body.host_ip:
             device_doc["host_ip"] = body.host_ip
+        if body.whoami:
+            device_doc["whoami"] = body.whoami
         await db.devices.insert_one(device_doc)
         logger.info(f"Device {did} registered (name={body.device_name}) token=...{token[-6:]}")
         return {"success": True, "device_id": did, "auth_token": token}
@@ -504,7 +530,8 @@ async def list_devices():
         
         async for d in cursor:
             # Derive status from live WS map — single source of truth
-            status = device_status(d["device_id"])
+            mongodb_status = d.get("status", "")
+            status = device_status(d["device_id"], mongodb_status)
             
             entry = {
                 "device_id": d["device_id"],
@@ -515,6 +542,8 @@ async def list_devices():
             }
             if d.get("host_ip"):
                 entry["host_ip"] = d["host_ip"]
+            if d.get("whoami"):
+                entry["whoami"] = d["whoami"]
             devices_list.append(entry)
         
         return {"devices": devices_list}
@@ -587,15 +616,18 @@ async def get_device(device_id: str):
         if not d:
             return {"exists": False}
         
+        mongodb_status = d.get("status", "")
         result = {
             "exists": True,
             "device_id": d["device_id"],
             "device_name": d["device_name"],
-            "status": device_status(device_id),  # live, not cached
+            "status": device_status(device_id, mongodb_status),  # live, not cached
             "last_seen": d["last_seen"],
         }
         if d.get("host_ip"):
             result["host_ip"] = d["host_ip"]
+        if d.get("whoami"):
+            result["whoami"] = d["whoami"]
         return result
     except Exception as e:
         logger.error(f"[GET_DEVICE] Failed to get device {device_id}: {e}")
@@ -653,6 +685,57 @@ async def get_device_note(device_id: str):
             updated_at=doc["updated_at"].isoformat()
         )
     
+    return await safe_mongo_operation(operation)
+
+
+# ── Multi-Note Endpoints (multiple notes per device) ──────────
+@api_router.post("/device-notes")
+async def add_device_note(req: NoteEntry):
+    """Add a new note to a device. Appends to existing notes array."""
+    async def operation():
+        now = datetime.now(timezone.utc)
+        doc = {
+            "device_id": req.device_id,
+            "note": req.note,
+            "author": req.author,
+            "created_at": now
+        }
+        result = await db.device_notes.insert_one(doc)
+        return {
+            "success": True,
+            "id": str(result.inserted_id),
+            "device_id": req.device_id,
+            "created_at": now.isoformat()
+        }
+    return await safe_mongo_operation(operation)
+
+
+@api_router.get("/device-notes/{device_id}")
+async def list_device_notes(device_id: str):
+    """List all notes for a device, newest first."""
+    async def operation():
+        cursor = db.device_notes.find({"device_id": device_id}).sort("created_at", -1)
+        notes = []
+        async for doc in cursor:
+            notes.append(NoteEntryResponse(
+                id=str(doc["_id"]),
+                device_id=doc["device_id"],
+                note=doc["note"],
+                author=doc.get("author", "admin"),
+                created_at=doc["created_at"].isoformat()
+            ))
+        return {"device_id": device_id, "notes": notes}
+    return await safe_mongo_operation(operation)
+
+
+@api_router.delete("/device-notes/{note_id}")
+async def delete_device_note(note_id: str):
+    """Delete a specific note by its _id."""
+    async def operation():
+        result = await db.device_notes.delete_one({"_id": ObjectId(note_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Note not found")
+        return {"success": True}
     return await safe_mongo_operation(operation)
 
 
@@ -821,6 +904,30 @@ async def get_device_camera(device_id: str):
             updated_at=doc["updated_at"].isoformat()
         )
     return await safe_mongo_operation(operation)
+
+
+@api_router.post("/devices/{device_id}/boot-heartbeat")
+async def device_boot_heartbeat(device_id: str):
+    """Boot-time heartbeat — called by PrinterSarvices --boot service before user logs in.
+    Marks the device as 'booting' and updates last_seen so it shows as recently active."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        device = await db.devices.find_one({"device_id": device_id})
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        now = datetime.now(timezone.utc).isoformat()
+        await db.devices.update_one(
+            {"device_id": device_id},
+            {"$set": {"last_seen": now, "status": "booting"}}
+        )
+        logger.info(f"[BOOT] Device {device_id} boot heartbeat (last_seen updated)")
+        return {"success": True, "device_id": device_id, "last_seen": now}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[BOOT] Error for device {device_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process boot heartbeat")
 
 
 @api_router.post("/device-camera/capture/{device_id}")
