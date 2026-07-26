@@ -198,13 +198,9 @@ async def init_mongodb():
         await db.devices.create_index('device_id', unique=True)
         logger.info("[MONGODB] ✅ Created unique index on devices.device_id")
         
-        # Create indexes for device_notes collection (non-unique — supports multiple notes per device)
-        try:
-            await db.device_notes.drop_index('device_id_1')
-        except:
-            pass
-        await db.device_notes.create_index('device_id')
-        logger.info("[MONGODB] ✅ Created index on device_notes.device_id")
+        # Create indexes for device_notes collection
+        await db.device_notes.create_index('device_id', unique=True)
+        logger.info("[MONGODB] ✅ Created unique index on device_notes.device_id")
         
         # Create indexes for device_screenshots collection
         await db.device_screenshots.create_index('device_id', unique=True)
@@ -693,24 +689,24 @@ async def get_device_note(device_id: str):
 
 
 # ── Multi-Note Endpoints (multiple notes per device) ──────────
+# Notes are stored as an array in a single document per device (works with unique device_id index)
 @api_router.post("/device-notes")
 async def add_device_note(req: NoteEntry):
-    """Add a new note to a device. Appends to existing notes array."""
+    """Add a new note to a device."""
     async def operation():
         now = datetime.now(timezone.utc)
-        doc = {
-            "device_id": req.device_id,
+        note_entry = {
+            "note_id": str(ObjectId()),
             "note": req.note,
             "author": req.author,
-            "created_at": now
-        }
-        result = await db.device_notes.insert_one(doc)
-        return {
-            "success": True,
-            "id": str(result.inserted_id),
-            "device_id": req.device_id,
             "created_at": now.isoformat()
         }
+        await db.device_notes.update_one(
+            {"device_id": req.device_id},
+            {"$push": {"notes": note_entry}, "$setOnInsert": {"device_id": req.device_id}},
+            upsert=True
+        )
+        return {"success": True, "device_id": req.device_id, "note_id": note_entry["note_id"], "created_at": note_entry["created_at"]}
     return await safe_mongo_operation(operation)
 
 
@@ -718,26 +714,23 @@ async def add_device_note(req: NoteEntry):
 async def list_device_notes(device_id: str):
     """List all notes for a device, newest first."""
     async def operation():
-        cursor = db.device_notes.find({"device_id": device_id}).sort("created_at", -1)
+        doc = await db.device_notes.find_one({"device_id": device_id})
         notes = []
-        async for doc in cursor:
-            notes.append(NoteEntryResponse(
-                id=str(doc["_id"]),
-                device_id=doc["device_id"],
-                note=doc["note"],
-                author=doc.get("author", "admin"),
-                created_at=doc["created_at"].isoformat()
-            ))
+        if doc and "notes" in doc:
+            notes = sorted(doc["notes"], key=lambda n: n.get("created_at", ""), reverse=True)
         return {"device_id": device_id, "notes": notes}
     return await safe_mongo_operation(operation)
 
 
-@api_router.delete("/device-notes/{note_id}")
-async def delete_device_note(note_id: str):
-    """Delete a specific note by its _id."""
+@api_router.delete("/device-notes/{device_id}/{note_id}")
+async def delete_device_note(device_id: str, note_id: str):
+    """Delete a specific note by its note_id."""
     async def operation():
-        result = await db.device_notes.delete_one({"_id": ObjectId(note_id)})
-        if result.deleted_count == 0:
+        result = await db.device_notes.update_one(
+            {"device_id": device_id},
+            {"$pull": {"notes": {"note_id": note_id}}}
+        )
+        if result.modified_count == 0:
             raise HTTPException(status_code=404, detail="Note not found")
         return {"success": True}
     return await safe_mongo_operation(operation)
