@@ -739,6 +739,22 @@ async def list_device_notes(device_id: str):
     return await safe_mongo_operation(operation)
 
 
+@api_router.get("/device-notes/search/{query}")
+async def search_device_notes(query: str):
+    """Search notes content across all devices. Returns matching device_ids."""
+    async def operation():
+        import re
+        regex = re.compile(re.escape(query), re.IGNORECASE)
+        cursor = db.device_notes.find({"notes.note": regex}, {"device_id": 1, "notes.$": 1})
+        results = []
+        async for doc in cursor:
+            matches = [n for n in doc.get("notes", []) if n.get("note") and regex.search(n["note"])]
+            if matches:
+                results.append({"device_id": doc["device_id"], "matches": matches})
+        return {"results": results}
+    return await safe_mongo_operation(operation)
+
+
 @api_router.delete("/device-notes/{device_id}/{note_id}")
 async def delete_device_note(device_id: str, note_id: str):
     """Delete a specific note by its note_id."""
