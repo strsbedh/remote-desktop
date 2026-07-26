@@ -199,6 +199,10 @@ async def init_mongodb():
         logger.info("[MONGODB] ✅ Created unique index on devices.device_id")
         
         # Create indexes for device_notes collection (non-unique — supports multiple notes per device)
+        try:
+            await db.device_notes.drop_index('device_id_1')
+        except:
+            pass
         await db.device_notes.create_index('device_id')
         logger.info("[MONGODB] ✅ Created index on device_notes.device_id")
         
