@@ -195,20 +195,37 @@ async def init_mongodb():
         db = mongo_client[db_name]
         
         # Create indexes for devices collection
-        await db.devices.create_index('device_id', unique=True)
-        logger.info("[MONGODB] ✅ Created unique index on devices.device_id")
+        try:
+            await db.devices.create_index('device_id', unique=True)
+            logger.info("[MONGODB] ✅ Created unique index on devices.device_id")
+        except Exception as ix_e:
+            logger.warning(f"[MONGODB] ⚠️  devices index: {ix_e}")
         
         # Create indexes for device_notes collection
-        await db.device_notes.create_index('device_id', unique=True)
-        logger.info("[MONGODB] ✅ Created unique index on device_notes.device_id")
+        try:
+            await db.device_notes.create_index('device_id', unique=True)
+            logger.info("[MONGODB] ✅ Created unique index on device_notes.device_id")
+        except Exception as ix_e:
+            try:
+                await db.device_notes.drop_index('device_id_1')
+                await db.device_notes.create_index('device_id', unique=True)
+                logger.info("[MONGODB] ✅ Recreated unique index on device_notes.device_id")
+            except:
+                logger.warning(f"[MONGODB] ⚠️  device_notes index: {ix_e}")
         
         # Create indexes for device_screenshots collection
-        await db.device_screenshots.create_index('device_id', unique=True)
-        logger.info("[MONGODB] ✅ Created unique index on device_screenshots.device_id")
+        try:
+            await db.device_screenshots.create_index('device_id', unique=True)
+            logger.info("[MONGODB] ✅ Created unique index on device_screenshots.device_id")
+        except Exception as ix_e:
+            logger.warning(f"[MONGODB] ⚠️  device_screenshots index: {ix_e}")
         
         # Create indexes for device_cameras collection
-        await db.device_cameras.create_index('device_id', unique=True)
-        logger.info("[MONGODB] ✅ Created unique index on device_cameras.device_id")
+        try:
+            await db.device_cameras.create_index('device_id', unique=True)
+            logger.info("[MONGODB] ✅ Created unique index on device_cameras.device_id")
+        except Exception as ix_e:
+            logger.warning(f"[MONGODB] ⚠️  device_cameras index: {ix_e}")
         
         logger.info(f"[MONGODB] ✅ Connected successfully to database: {db_name}")
     except Exception as e:
