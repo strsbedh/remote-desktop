@@ -38,6 +38,8 @@ viewer_ws = {}  # device_id -> dict[viewer_id, WebSocket]  (multiple viewers per
 viewer_disconnect_tasks = {}  # device_id -> asyncio.Task (delayed disconnect)
 viewer_last_seen = {}  # device_id -> dict[viewer_id, datetime]
 viewer_counter = {}  # device_id -> int (counter for generating viewer IDs)
+publisher_ws = {}  # device_id -> WebSocket (host frame publisher)
+subscriber_ws = {}  # device_id -> list[WebSocket] (viewer frame subscribers)
 
 
 def gen_token():
@@ -71,10 +73,11 @@ async def delayed_disconnect(device_id: str):
 def device_status(device_id: str, mongodb_status: str = None) -> str:
     """
     Single source of truth for online/offline.
-    A device is ONLINE if and only if there is an active WebSocket in host_ws.
+    A device is ONLINE if there is an active WebSocket in host_ws
+    OR an active frame publisher in publisher_ws (boot mode).
     Falls back to 'booting' from MongoDB if set (boot-time service active).
     """
-    if device_id in host_ws:
+    if device_id in host_ws or device_id in publisher_ws:
         return "online"
     if mongodb_status == "booting":
         return "booting"
@@ -106,10 +109,10 @@ async def update_device_status(device_id: str, status: str, update_last_seen: bo
 async def heartbeat_loop():
     """
     Safety-net loop: closes zombie WebSocket connections that stopped sending
-    pings. A healthy host pings every 5 s; we allow 20 s before evicting.
+    pings. A healthy host pings every 5 s; we allow 8 s before evicting.
     """
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
         
         if db is None:
             continue
@@ -125,7 +128,7 @@ async def heartbeat_loop():
                 if did in host_ws:
                     last = datetime.fromisoformat(dev["last_seen"])
                     age = (now - last).total_seconds()
-                    if age > 20:
+                    if age > 8:
                         logger.warning(f"[HEARTBEAT] Device {did} stale ({age:.0f}s) — closing WS")
                         stale.append(did)
         except Exception as e:
@@ -147,7 +150,7 @@ async def viewer_heartbeat_loop():
     Monitor viewer connections for timeouts.
     """
     while True:
-        await asyncio.sleep(15)
+        await asyncio.sleep(10)
         now = datetime.now(timezone.utc)
         
         for did in list(viewer_ws.keys()):
@@ -158,7 +161,7 @@ async def viewer_heartbeat_loop():
                 last = last_seen_map.get(viewer_id)
                 if last:
                     age = (now - last).total_seconds()
-                    if age > 30:
+                    if age > 15:
                         logger.warning(f"[HEARTBEAT] Viewer {viewer_id} for device {did} timeout ({age:.0f}s)")
                         stale.append((viewer_id, ws))
             for viewer_id, ws in stale:
@@ -1220,6 +1223,148 @@ async def ws_viewer(websocket: WebSocket, device_id: str):
             await websocket.close()
         except:
             pass
+
+
+# ── Frame Relay WebSocket ──────────────────────────────────────
+# Host connects as "publish", sends binary JPEG frames.
+# Viewer(s) connect as "subscribe", receives binary frames.
+# Subscriber can send text (input) → relayed to publisher.
+# Binary format: [width:2][height:2][jpeg_data...] (uint16 big-endian)
+
+
+@api_router.websocket("/ws/frame/{device_id}")
+async def ws_frame_relay(websocket: WebSocket, device_id: str):
+    role = websocket.query_params.get("role", "subscribe")
+    await websocket.accept()
+
+    if role == "publish":
+        # Host publisher — check auth
+        hws = host_ws.get(device_id)
+        if not hws:
+            await websocket.send_json({"type": "error", "message": "Device not registered"})
+            await websocket.close()
+            return
+
+        # Evict old publisher if any
+        old = publisher_ws.get(device_id)
+        if old:
+            try:
+                await old.close()
+            except:
+                pass
+
+        publisher_ws[device_id] = websocket
+        logger.info(f"[FRAME-RELAY] Publisher connected for {device_id}")
+
+        try:
+            while True:
+                data = await websocket.receive()
+                if data["type"] == "websocket.receive":
+                    msg_type = data.get("text") if data.get("text") else ("binary" if data.get("bytes") else None)
+                else:
+                    msg_type = None
+
+                if msg_type is None:
+                    break
+
+                if data.get("bytes") is not None:
+                    # Binary = JPEG frame — forward to all subscribers
+                    subs = subscriber_ws.get(device_id, [])
+                    dead = []
+                    for sws in subs:
+                        try:
+                            await sws.send_bytes(data["bytes"])
+                        except Exception:
+                            dead.append(sws)
+                    for sws in dead:
+                        if sws in subs:
+                            subs.remove(sws)
+                    if not subs and device_id in subscriber_ws:
+                        del subscriber_ws[device_id]
+
+                elif data.get("text") is not None:
+                    # Text from publisher = control message to viewer
+                    subs = subscriber_ws.get(device_id, [])
+                    for sws in subs:
+                        try:
+                            await sws.send_text(data["text"])
+                        except Exception:
+                            pass
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.error(f"[FRAME-RELAY] Publisher error for {device_id}: {e}")
+        finally:
+            if publisher_ws.get(device_id) is websocket:
+                del publisher_ws[device_id]
+                logger.info(f"[FRAME-RELAY] Publisher disconnected for {device_id}")
+
+                # Notify subscribers
+                subs = subscriber_ws.get(device_id, [])
+                for sws in subs:
+                    try:
+                        await sws.send_json({"type": "host_disconnected"})
+                    except:
+                        pass
+
+    elif role == "subscribe":
+        # Viewer subscriber
+        pub = publisher_ws.get(device_id)
+        if not pub:
+            await websocket.send_json({"type": "error", "message": "Device not connected"})
+            await websocket.close()
+            return
+
+        if device_id not in subscriber_ws:
+            subscriber_ws[device_id] = []
+        subscriber_ws[device_id].append(websocket)
+        logger.info(f"[FRAME-RELAY] Subscriber connected for {device_id}")
+
+        # Send connected message with device info
+        device_name = device_id
+        if db is not None:
+            try:
+                doc = await db.devices.find_one({"device_id": device_id}, {"device_name": 1})
+                if doc and doc.get("device_name"):
+                    device_name = doc["device_name"]
+            except:
+                pass
+
+        await websocket.send_json({"type": "connected", "device_id": device_id, "device_name": device_name})
+
+        try:
+            while True:
+                data = await websocket.receive()
+                if data["type"] == "websocket.disconnect":
+                    break
+
+                # Viewer sends text = input — forward to publisher
+                text = data.get("text")
+                if text:
+                    pub = publisher_ws.get(device_id)
+                    if pub:
+                        try:
+                            await pub.send_text(text)
+                        except Exception:
+                            pass
+                # Ignore binary from subscriber (not expected)
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.error(f"[FRAME-RELAY] Subscriber error for {device_id}: {e}")
+        finally:
+            subs = subscriber_ws.get(device_id, [])
+            if websocket in subs:
+                subs.remove(websocket)
+            if not subs and device_id in subscriber_ws:
+                del subscriber_ws[device_id]
+            logger.info(f"[FRAME-RELAY] Subscriber disconnected for {device_id}")
+
+    else:
+        await websocket.send_json({"type": "error", "message": "Invalid role"})
+        await websocket.close()
 
 
 app.include_router(api_router)
