@@ -1238,13 +1238,7 @@ async def ws_frame_relay(websocket: WebSocket, device_id: str):
     await websocket.accept()
 
     if role == "publish":
-        # Host publisher — check auth
-        hws = host_ws.get(device_id)
-        if not hws:
-            await websocket.send_json({"type": "error", "message": "Device not registered"})
-            await websocket.close()
-            return
-
+        # Host publisher — accept directly (FrameRelay is the primary connection now)
         # Evict old publisher if any
         old = publisher_ws.get(device_id)
         if old:
