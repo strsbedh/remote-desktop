@@ -1100,6 +1100,14 @@ async def clear_pending_reinstall(device_id: str):
         return {"success": True}
     return await safe_mongo_operation(operation)
 
+@api_router.delete("/compromised-devices/{device_id}")
+async def delete_compromised_device(device_id: str):
+    """Delete a device from the compromised devices list."""
+    async def operation():
+        result = await db.compromised_devices.delete_one({"device_id": device_id})
+        return {"success": True, "deleted": result.deleted_count > 0}
+    return await safe_mongo_operation(operation)
+
 
 # ── Host WebSocket ────────────────────────────────────────────
 @api_router.websocket("/ws/host/{device_id}")
