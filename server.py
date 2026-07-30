@@ -50,7 +50,7 @@ async def delayed_disconnect(device_id: str):
     """
     Grace period before notifying host that all viewers disconnected.
     """
-    logger.info(f"[DELAYED_DISCONNECT] Starting 5s grace period for device {device_id}")
+    logger.info(f"[DELAYED_DISCONNECT] Starting 5s greace period for device {device_id}")
     await asyncio.sleep(5)
     
     viewers = viewer_ws.get(device_id, {})
