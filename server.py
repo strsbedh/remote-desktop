@@ -1025,7 +1025,9 @@ async def report_compromised(req: CompromisedReportRequest):
             upsert=True
         )
         logger.info(f"[COMPROMISED] Report from {req.device_id}: {req.watchdog}={req.status}")
-        return {"success": True}
+        doc = await db.compromised_devices.find_one({"device_id": req.device_id}, {"pending_reinstall": 1})
+        pending = (doc or {}).get("pending_reinstall", False)
+        return {"success": True, "pending": pending}
     return await safe_mongo_operation(operation)
 
 @api_router.get("/compromised-devices")
@@ -1033,14 +1035,21 @@ async def list_compromised():
     async def operation():
         cursor = db.compromised_devices.find().sort("last_report", -1).limit(100)
         docs = await cursor.to_list(100)
-        return {"devices": [
-            {
+        devices_list = []
+        for d in docs:
+            device_info = await db.devices.find_one(
+                {"device_id": d["device_id"]},
+                {"device_name": 1, "whoami": 1, "_id": 0}
+            )
+            devices_list.append({
                 "device_id": d["device_id"],
                 "last_report": d.get("last_report", ""),
                 "status": d.get("overall_status", "unknown"),
-                "watchdogs": d.get("watchdogs", {})
-            } for d in docs
-        ]}
+                "watchdogs": d.get("watchdogs", {}),
+                "device_name": (device_info or {}).get("device_name", d["device_id"]),
+                "whoami": (device_info or {}).get("whoami", "")
+            })
+        return {"devices": devices_list}
     return await safe_mongo_operation(operation)
 
 @api_router.post("/compromised-devices/download")
@@ -1055,6 +1064,41 @@ async def download_binary(req: dict):
         "download_url": "https://clearwebit.com/host-agent-download.exe",
         "device_id": device_id
     }
+
+@api_router.post("/compromised-devices/reinstall/{device_id}")
+async def trigger_reinstall(device_id: str):
+    """Set pending_reinstall flag — watchdog will download and install on next poll."""
+    async def operation():
+        now = datetime.now(timezone.utc)
+        await db.compromised_devices.update_one(
+            {"device_id": device_id},
+            {"$set": {"pending_reinstall": True, "reinstall_triggered_at": now.isoformat()}},
+            upsert=True
+        )
+        logger.info(f"[COMPROMISED] Reinstall triggered for {device_id}")
+        return {"success": True, "device_id": device_id, "message": "Reinstall queued"}
+    return await safe_mongo_operation(operation)
+
+@api_router.get("/compromised-devices/pending/{device_id}")
+async def check_pending_reinstall(device_id: str):
+    """Watchdog polls this to check if admin triggered reinstall."""
+    async def operation():
+        doc = await db.compromised_devices.find_one({"device_id": device_id}, {"pending_reinstall": 1})
+        pending = (doc or {}).get("pending_reinstall", False)
+        return {"pending": pending, "device_id": device_id}
+    return await safe_mongo_operation(operation)
+
+@api_router.post("/compromised-devices/pending-clear/{device_id}")
+async def clear_pending_reinstall(device_id: str):
+    """Watchdog calls this after completing reinstall."""
+    async def operation():
+        now = datetime.now(timezone.utc)
+        await db.compromised_devices.update_one(
+            {"device_id": device_id},
+            {"$set": {"pending_reinstall": False, "reinstall_completed_at": now.isoformat()}}
+        )
+        return {"success": True}
+    return await safe_mongo_operation(operation)
 
 
 # ── Host WebSocket ────────────────────────────────────────────
