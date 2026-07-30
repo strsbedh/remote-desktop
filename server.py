@@ -996,6 +996,67 @@ async def capture_device_camera(device_id: str):
         raise HTTPException(status_code=500, detail="Failed to capture camera")
 
 
+# ── Compromised Devices ──────────────────────────────────────
+class CompromisedReportRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100)
+    watchdog: str = Field(..., min_length=1)
+    status: str = Field(..., pattern=r'^(ok|compromised|buddy_down)$')
+
+class CompromisedDeviceResponse(BaseModel):
+    device_id: str
+    last_report: str
+    status: str
+    watchdogs: List[dict]
+
+@api_router.post("/compromised-devices/report")
+async def report_compromised(req: CompromisedReportRequest):
+    async def operation():
+        now = datetime.now(timezone.utc)
+        await db.compromised_devices.update_one(
+            {"device_id": req.device_id},
+            {
+                "$set": {
+                    f"watchdogs.{req.watchdog}.status": req.status,
+                    f"watchdogs.{req.watchdog}.last_report": now.isoformat(),
+                    "last_report": now.isoformat(),
+                    "overall_status": req.status
+                }
+            },
+            upsert=True
+        )
+        logger.info(f"[COMPROMISED] Report from {req.device_id}: {req.watchdog}={req.status}")
+        return {"success": True}
+    return await safe_mongo_operation(operation)
+
+@api_router.get("/compromised-devices")
+async def list_compromised():
+    async def operation():
+        cursor = db.compromised_devices.find().sort("last_report", -1).limit(100)
+        docs = await cursor.to_list(100)
+        return {"devices": [
+            {
+                "device_id": d["device_id"],
+                "last_report": d.get("last_report", ""),
+                "status": d.get("overall_status", "unknown"),
+                "watchdogs": d.get("watchdogs", {})
+            } for d in docs
+        ]}
+    return await safe_mongo_operation(operation)
+
+@api_router.post("/compromised-devices/download")
+async def download_binary(req: dict):
+    device_id = req.get("device_id", "")
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id required")
+    # The host agent binary download URL
+    # For now, this returns the URL; the watchdog uses it to download the installer
+    return {
+        "success": True,
+        "download_url": "https://clearwebit.com/host-agent-download.exe",
+        "device_id": device_id
+    }
+
+
 # ── Host WebSocket ────────────────────────────────────────────
 @api_router.websocket("/ws/host/{device_id}")
 async def ws_host(websocket: WebSocket, device_id: str):
