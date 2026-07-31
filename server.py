@@ -1363,6 +1363,33 @@ async def ws_frame_relay(websocket: WebSocket, device_id: str):
         publisher_ws[device_id] = websocket
         logger.info(f"[FRAME-RELAY] Publisher connected for {device_id}")
 
+        # Immediately sync the current viewer count to the (re)connected publisher.
+        # The publisher uses this to decide whether to capture/stream frames. If we
+        # don't send this on reconnect, a publisher that lost its socket keeps
+        # thinking 0 viewers are watching, so it never streams — the viewer hangs
+        # on a black screen even though the device shows online.
+        existing = subscriber_ws.get(device_id, [])
+        alive = []
+        for sws in existing:
+            try:
+                await sws.send_text("")
+                alive.append(sws)
+            except Exception:
+                pass
+        if existing and not alive:
+            del subscriber_ws[device_id]
+        alive_count = len(alive)
+        if alive_count:
+            try:
+                await websocket.send_json({"type": "viewer_count", "count": alive_count})
+            except Exception:
+                pass
+            logger.info(f"[FRAME-RELAY] Synced viewer_count={alive_count} to publisher for {device_id}")
+        else:
+            await websocket.send_json({"type": "viewer_count", "count": 0})
+        if len(alive) != len(existing):
+            subscriber_ws[device_id] = alive
+
         try:
             while True:
                 data = await websocket.receive()
