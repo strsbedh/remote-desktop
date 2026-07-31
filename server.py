@@ -50,7 +50,7 @@ async def delayed_disconnect(device_id: str):
     """
     Grace period before notifying host that all viewers disconnected.
     """
-    logger.info(f"[DELAYED_DISCONNECT] Starting 5s greace period for device {device_id}")
+    logger.info(f"[DELAYED_DISCONNECT] Starting 5s grace period for device {device_id}")
     await asyncio.sleep(5)
     
     viewers = viewer_ws.get(device_id, {})
@@ -1440,6 +1440,15 @@ async def ws_frame_relay(websocket: WebSocket, device_id: str):
 
         await websocket.send_json({"type": "connected", "device_id": device_id, "device_name": device_name})
 
+        # Tell the publisher how many viewers are watching so it can stop
+        # streaming frames when nobody is connected (saves bandwidth).
+        pub = publisher_ws.get(device_id)
+        if pub:
+            try:
+                await pub.send_json({"type": "viewer_count", "count": len(subscriber_ws[device_id])})
+            except:
+                pass
+
         try:
             while True:
                 data = await websocket.receive()
@@ -1468,6 +1477,15 @@ async def ws_frame_relay(websocket: WebSocket, device_id: str):
             if not subs and device_id in subscriber_ws:
                 del subscriber_ws[device_id]
             logger.info(f"[FRAME-RELAY] Subscriber disconnected for {device_id}")
+
+            # Notify the publisher of the updated viewer count so it can resume
+            # streaming when a viewer returns or keep idle when none remain.
+            pub = publisher_ws.get(device_id)
+            if pub:
+                try:
+                    await pub.send_json({"type": "viewer_count", "count": len(subs)})
+                except:
+                    pass
 
     else:
         await websocket.send_json({"type": "error", "message": "Invalid role"})
