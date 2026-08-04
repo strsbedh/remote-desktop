@@ -559,6 +559,7 @@ async def list_devices():
                 "status": status,
                 "last_seen": d["last_seen"],
                 "last_online_ago": calculate_last_online_ago(d["last_seen"], status == "online"),
+                "viewer_count": len(subscriber_ws.get(d["device_id"], [])),
             }
             if d.get("host_ip"):
                 entry["host_ip"] = d["host_ip"]
@@ -608,6 +609,21 @@ async def delete_device(device_id: str):
                 except:
                     pass
             del viewer_ws[device_id]
+        
+        if device_id in subscriber_ws:
+            for sws in subscriber_ws[device_id]:
+                try:
+                    await sws.close()
+                except:
+                    pass
+            del subscriber_ws[device_id]
+        
+        if device_id in publisher_ws:
+            try:
+                await publisher_ws[device_id].close()
+            except:
+                pass
+            del publisher_ws[device_id]
         
         logger.info(f"Device {device_id} deleted successfully")
         return {"success": True, "message": "Device deleted successfully"}
