@@ -456,13 +456,14 @@ async def register_device(body: RegisterBody):
                 logger.warning(f"Device {did} re-registration rejected — invalid token")
                 return {"success": False, "error": "Invalid auth token"}
             
-            # Update mutable fields; preserve auth_token, status, AND device_name (dashboard rename)
+            # Update mutable fields; preserve auth_token, status, device_name (dashboard rename),
+            # AND whoami (manual rename / auto-detected at first registration) so the label sticks.
             update = {
                 "last_seen": datetime.now(timezone.utc).isoformat()
             }
             if body.host_ip:
                 update["host_ip"] = body.host_ip
-            if body.whoami:
+            if body.whoami and not existing.get("whoami"):
                 update["whoami"] = body.whoami
             await db.devices.update_one(
                 {"device_id": did},
