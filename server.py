@@ -40,6 +40,7 @@ viewer_last_seen = {}  # device_id -> dict[viewer_id, datetime]
 viewer_counter = {}  # device_id -> int (counter for generating viewer IDs)
 publisher_ws = {}  # device_id -> WebSocket (host frame publisher)
 subscriber_ws = {}  # device_id -> list[WebSocket] (viewer frame subscribers)
+publisher_gone_tasks = {}  # device_id -> asyncio.Task (delayed host_disconnected notify)
 
 
 def gen_token():
@@ -68,6 +69,25 @@ async def delayed_disconnect(device_id: str):
     
     if device_id in viewer_disconnect_tasks:
         del viewer_disconnect_tasks[device_id]
+
+
+async def notify_subscribers_host_gone(device_id: str):
+    """
+    Grace period before telling frame subscribers the host went offline.
+    The host's publisher socket briefly reconnects during churn; waiting out
+    that window means viewers see a frame gap instead of a disconnect loop.
+    """
+    await asyncio.sleep(25)
+    if device_id in publisher_ws:
+        return  # publisher came back — nothing to notify
+    logger.info(f"[FRAME-RELAY] Notifying subscribers host {device_id} went offline")
+    subs = subscriber_ws.get(device_id, [])
+    for sws in subs:
+        try:
+            await sws.send_json({"type": "host_disconnected"})
+        except Exception:
+            pass
+    publisher_gone_tasks.pop(device_id, None)
 
 
 def device_status(device_id: str, mongodb_status: str = None) -> str:
@@ -1454,9 +1474,14 @@ async def ws_frame_relay(websocket: WebSocket, device_id: str):
     await websocket.accept()
 
     if role == "publish":
-        # Host publisher — accept directly (FrameRelay is the primary connection now)
+        # Host publisher - accept directly (FrameRelay is the primary connection now)
         # Evict old publisher if any
         old = publisher_ws.get(device_id)
+        # A publisher (re)connected — cancel any pending "host went offline"
+        # notification so viewers aren't kicked during brief socket churn.
+        gone_task = publisher_gone_tasks.pop(device_id, None)
+        if gone_task:
+            gone_task.cancel()
         if old:
             try:
                 await old.close()
@@ -1537,13 +1562,13 @@ async def ws_frame_relay(websocket: WebSocket, device_id: str):
                 del publisher_ws[device_id]
                 logger.info(f"[FRAME-RELAY] Publisher disconnected for {device_id}")
 
-                # Notify subscribers
-                subs = subscriber_ws.get(device_id, [])
-                for sws in subs:
-                    try:
-                        await sws.send_json({"type": "host_disconnected"})
-                    except:
-                        pass
+                # Notify subscribers — but only after a grace period. The host's
+                # frame publisher briefly reconnects during churn; kicking viewers
+                # on every blip made them see "disconnected again and again".
+                if device_id not in publisher_gone_tasks:
+                    publisher_gone_tasks[device_id] = asyncio.create_task(
+                        notify_subscribers_host_gone(device_id)
+                    )
 
     elif role == "subscribe":
         # Viewer subscriber
