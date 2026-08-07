@@ -570,17 +570,29 @@ async def list_devices():
         cursor = db.devices.find({})
         
         async for d in cursor:
+            device_id = d.get("device_id", "")
+            if not device_id:
+                logger.warning("[DEVICES] Skipping document without device_id")
+                continue
+
+            # A document missing required fields would otherwise KeyError and
+            # 500 the whole list — default and skip so one bad row can't break
+            # the admin panel for every device.
+            if "device_name" not in d or "last_seen" not in d:
+                logger.warning(f"[DEVICES] Skipping malformed document for {device_id}")
+                continue
+
             # Derive status from live WS map — single source of truth
             mongodb_status = d.get("status", "")
-            status = device_status(d["device_id"], mongodb_status)
+            status = device_status(device_id, mongodb_status)
             
             entry = {
-                "device_id": d["device_id"],
+                "device_id": device_id,
                 "device_name": d["device_name"],
                 "status": status,
                 "last_seen": d["last_seen"],
                 "last_online_ago": calculate_last_online_ago(d["last_seen"], status == "online"),
-                "viewer_count": len(subscriber_ws.get(d["device_id"], [])),
+                "viewer_count": len(subscriber_ws.get(device_id, [])),
             }
             # HostCacheHelper liveness — separate heartbeat signal from the main WS.
             helper_last_seen = d.get("helper_last_seen", "")
